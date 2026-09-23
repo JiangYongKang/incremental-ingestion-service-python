@@ -1,8 +1,4 @@
-from fastapi import FastAPI
+"""兼容原始骨架入口：实际应用见 app.main。"""
+from app.main import app
 
-app = FastAPI()
-
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app"]
