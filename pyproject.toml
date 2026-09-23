@@ -6,6 +6,18 @@ dependencies = [
     "fastapi[standard]>=0.141.1",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
 default = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s | %(levelname)s | event=%(event_id)s source=%(source)s seq=%(seq)s cp=%(checkpoint)s verdict=%(verdict)s reason=%(reason)s attempts=%(attempts)s | %(message)s"
