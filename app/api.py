@@ -1,9 +1,10 @@
 """HTTP 接口层。
 
 状态码约定：
-200 APPLIED / DUPLICATE / replay 成功
+200 APPLIED / DUPLICATE / replay 成功；批量投递恒为 200（逐条结果看响应体）
 202 RETRYING（暂时失败，已记录尝试次数，可重投或 /resume）
-400 跨来源串用、请求体非 JSON 对象、缺少 event_id 等无法标识/路由的错误
+400 跨来源串用、请求体非 JSON 对象、缺少 event_id 等无法标识/路由的错误；
+    批量请求信封非法（events 缺失/不是数组）
 409 位点回退
 422 可标识的坏事件（已隔离）
 503 重试耗尽进入死信
@@ -32,6 +33,7 @@ from app.models import (
     EventResult,
     EventStatus,
     QuarantineView,
+    SourceProgress,
 )
 from app.service import CrossSourceError, IngestionService
 from app.store import LocalStore
@@ -118,6 +120,35 @@ async def post_event(source: str, request: Request) -> JSONResponse:
     return _result_response(result)
 
 
+@router.post("/v1/sources/{source}/events/batch")
+async def post_event_batch(source: str, request: Request) -> JSONResponse:
+    """批量投递同一来源的一批事件。
+
+    与单条接口共存：只要请求信封合法（{"events": [...]}），HTTP 恒为 200，
+    每条事件的判定/原因在 results 中按下标逐条给出；个别坏事件/重复/暂时失败
+    不会导致整批失败。信封本身非法（非 JSON、无 events、events 非数组）才返回 400。
+    """
+    try:
+        raw = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "BATCH_MALFORMED",
+                "message": "请求体不是合法 JSON",
+                "reason": "BATCH_MALFORMED",
+            },
+        )
+    try:
+        batch = get_service().ingest_batch(raw, source)
+    except UnroutableEvent as exc:
+        return _error_response(exc)
+    except IngestionError as exc:
+        return _error_response(exc)
+    # 批量整体不因单条结果而改变 HTTP 状态：逐条结论看 results[i].status
+    return JSONResponse(status_code=200, content=batch.model_dump(mode="json"))
+
+
 @router.post("/v1/checkpoints")
 async def post_checkpoint(body: CheckpointCommit) -> JSONResponse:
     try:
@@ -137,6 +168,13 @@ async def get_checkpoint(source: str) -> dict[str, Any]:
     return CheckpointView(
         source=source, last_seq=get_service().store.get_checkpoint(source)
     ).model_dump()
+
+
+@router.get("/v1/sources/{source}/progress")
+async def get_source_progress(source: str) -> dict[str, Any]:
+    """来源级进度对账：当前位点、已生效/隔离/死信/未完成条数，彼此对得上。"""
+    progress: SourceProgress = get_service().source_progress(source)
+    return progress.model_dump(mode="json")
 
 
 @router.post("/v1/sources/{source}/resume")
