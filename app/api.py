@@ -31,6 +31,7 @@ from app.models import (
     DeadLetterView,
     EventResult,
     EventStatus,
+    ProgressView,
     QuarantineView,
 )
 from app.service import CrossSourceError, IngestionService
@@ -116,6 +117,39 @@ async def post_event(source: str, request: Request) -> JSONResponse:
     except IngestionError as exc:
         return _error_response(exc)
     return _result_response(result)
+
+
+@router.post("/v1/sources/{source}/events/batch")
+async def post_event_batch(source: str, request: Request) -> JSONResponse:
+    """批量投递：逐条判定，个别坏事件/重复/暂时失败不连累整批。
+
+    只要批次信封合法（JSON 数组或 {"events": [...]}），统一返回 200，
+    每条事件的结果在 results 中按 index 对应查看。
+    """
+    try:
+        raw = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "MALFORMED_STRUCTURE",
+                "message": "请求体不是合法 JSON",
+                "reason": "MALFORMED_STRUCTURE",
+            },
+        )
+    try:
+        response = get_service().ingest_batch(raw, source)
+    except UnroutableEvent as exc:
+        return _error_response(exc)
+    except IngestionError as exc:
+        return _error_response(exc)
+    return JSONResponse(status_code=200, content=response.model_dump(mode="json"))
+
+
+@router.get("/v1/sources/{source}/progress")
+async def get_progress(source: str) -> dict[str, Any]:
+    """来源级进度对账：位点 + 各状态条数的一致性快照。"""
+    return get_service().progress(source).model_dump()
 
 
 @router.post("/v1/checkpoints")

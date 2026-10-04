@@ -16,6 +16,7 @@ class EventStatus(str, Enum):
     QUARANTINED = "QUARANTINED"    # 坏事件被隔离
     RETRYING = "RETRYING"          # 上游暂时失败，重试中
     DEAD_LETTER = "DEAD_LETTER"    # 重试耗尽，进入死信
+    REJECTED = "REJECTED"          # 无法标识/路由（仅批量投递的条目级结论）
 
 
 class RejectReason(str, Enum):
@@ -79,3 +80,47 @@ class QuarantineView(BaseModel):
     seq: int | None = None
     reason: RejectReason
     detail: str | None = None
+
+
+class BatchItemResult(BaseModel):
+    """批量投递中单条事件的判定结果。"""
+
+    index: int
+    event_id: str | None = None
+    source: str | None = None
+    seq: int | None = None
+    status: EventStatus
+    reason: RejectReason | str | None = None
+    attempts: int = 0
+    detail: str | None = None
+    duplicate_of: str | None = None
+
+
+class BatchSummary(BaseModel):
+    """批量投递的汇总计数（按判定状态）。"""
+
+    total: int
+    applied: int = 0
+    duplicate: int = 0
+    quarantined: int = 0
+    retrying: int = 0
+    dead_letter: int = 0
+    rejected: int = 0
+
+
+class BatchResponse(BaseModel):
+    source: str
+    summary: BatchSummary
+    results: list[BatchItemResult]
+
+
+class ProgressView(BaseModel):
+    """来源级进度对账快照（同一临界区内读取，保证不自相矛盾）。"""
+
+    source: str
+    last_seq: int
+    applied: int        # 账本中已生效条数
+    records: int        # 目标库实际落库条数
+    quarantined: int    # 隔离条数
+    dead_letter: int    # 死信条数
+    pending: int        # 尚未处理完（RETRYING）条数

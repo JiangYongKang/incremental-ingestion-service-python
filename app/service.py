@@ -24,9 +24,13 @@ from app.errors import (
 )
 from app.logging_conf import configure_logging, log_verdict
 from app.models import (
+    BatchItemResult,
+    BatchResponse,
+    BatchSummary,
     CheckpointErrorType,
     EventResult,
     EventStatus,
+    ProgressView,
     RejectReason,
 )
 from app.store import LocalStore
@@ -291,35 +295,39 @@ class IngestionService:
             body_source = url_source
             if isinstance(raw_event, dict) and isinstance(raw_event.get("source"), str):
                 body_source = raw_event["source"]
-            # 已被处理过的事件即使再次以畸形形态投递，也维持原判定，不重复隔离
-            if isinstance(raw_event, dict) and isinstance(exc.event_id, str):
-                existing = self.store.get_event(body_source, exc.event_id)
-                if existing is not None:
-                    known = EventStatus(existing["status"])
-                    if known in (
-                        EventStatus.APPLIED,
-                        EventStatus.QUARANTINED,
-                        EventStatus.DEAD_LETTER,
-                    ):
-                        return self._handle_existing(existing, {})
-                    if known is EventStatus.RETRYING:
-                        # 未完成事件的畸形重投不影响其续跑：用首次快照继续
-                        snapshot = existing.get("payload_snapshot") or {}
-                        return self._handle_existing(existing, snapshot)
-            seq_value = None
-            if isinstance(raw_event, dict) and _is_plain_int(raw_event.get("seq")):
-                seq_value = raw_event["seq"]
-            result = self._quarantine(exc, body_source, seq_value)
+            # 畸形重投的“查账本-决定-隔离”与正常路径在同一把来源锁内串行，
+            # 避免跨进程并发时同一事件一边被应用、一边被隔离
+            with self.store.transaction(body_source):
+                # 已被处理过的事件即使再次以畸形形态投递，也维持原判定，不重复隔离
+                if isinstance(raw_event, dict) and isinstance(exc.event_id, str):
+                    existing = self.store.get_event(body_source, exc.event_id)
+                    if existing is not None:
+                        known = EventStatus(existing["status"])
+                        if known in (
+                            EventStatus.APPLIED,
+                            EventStatus.QUARANTINED,
+                            EventStatus.DEAD_LETTER,
+                        ):
+                            return self._handle_existing(existing, {})
+                        if known is EventStatus.RETRYING:
+                            # 未完成事件的畸形重投不影响其续跑：用首次快照继续
+                            snapshot = existing.get("payload_snapshot") or {}
+                            return self._handle_existing(existing, snapshot)
+                seq_value = None
+                if isinstance(raw_event, dict) and _is_plain_int(raw_event.get("seq")):
+                    seq_value = raw_event["seq"]
+                result = self._quarantine(exc, body_source, seq_value)
             self._log(result)
             return result
 
-        # 2) 同一事件的重复/并发投递在此串行
+        # 2) 同一事件的重复/并发投递在此串行（进程内每键锁 + 跨进程来源事务）
         lock = self._get_inflight_lock(source, event_id)
         with lock:
-            existing = self.store.get_event(source, event_id)
-            if existing is not None:
-                return self._handle_existing(existing, payload)
-            return self._apply_once(event_id, source, seq, payload, attempts=0, new=True)
+            with self.store.transaction(source):
+                existing = self.store.get_event(source, event_id)
+                if existing is not None:
+                    return self._handle_existing(existing, payload)
+                return self._apply_once(event_id, source, seq, payload, attempts=0, new=True)
 
     def _handle_existing(
         self, existing: dict[str, Any], payload: dict[str, Any]
@@ -463,6 +471,130 @@ class IngestionService:
         return result
 
     # ------------------------------------------------------------------ #
+    # 批量投递
+    # ------------------------------------------------------------------ #
+    def ingest_batch(self, raw_batch: Any, url_source: str) -> BatchResponse:
+        """按批处理同一来源的事件：逐条走与单条投递完全相同的判定路径。
+
+        个别事件重复/畸形/暂时失败不影响同批其他事件，整批请求不因此失败；
+        只有批次信封本身非法（不是 JSON 数组）才整体拒绝。
+        """
+        if isinstance(raw_batch, dict) and isinstance(raw_batch.get("events"), list):
+            items = raw_batch["events"]
+        elif isinstance(raw_batch, list):
+            items = raw_batch
+        else:
+            raise UnroutableEvent(
+                "批量投递的请求体必须是 JSON 数组，或形如 {\"events\": [...]} 的对象",
+                RejectReason.MALFORMED_STRUCTURE,
+            )
+
+        results: list[BatchItemResult] = []
+        for index, item in enumerate(items):
+            results.append(self._ingest_batch_item(index, item, url_source))
+
+        summary = BatchSummary(total=len(results))
+        for r in results:
+            key = r.status.value.lower()
+            setattr(summary, key, getattr(summary, key) + 1)
+        self.log.info(
+            "batch completed",
+            extra={
+                "event_id": "-",
+                "source": url_source,
+                "seq": "-",
+                "checkpoint": self.store.get_checkpoint(url_source),
+                "verdict": "BATCH_DONE",
+                "reason": "-",
+                "attempts": 0,
+            },
+        )
+        return BatchResponse(source=url_source, summary=summary, results=results)
+
+    def _ingest_batch_item(
+        self, index: int, item: Any, url_source: str
+    ) -> BatchItemResult:
+        """单条目处理：复用 ingest 的全部语义，把异常折叠成条目级 REJECTED。"""
+        try:
+            result = self.ingest(item, url_source)
+            return BatchItemResult(
+                index=index,
+                event_id=result.event_id,
+                source=result.source,
+                seq=result.seq,
+                status=result.status,
+                reason=result.reason,
+                attempts=result.attempts,
+                detail=result.detail,
+                duplicate_of=result.duplicate_of,
+            )
+        except CrossSourceError as exc:
+            return self._rejected_item(
+                index, item, url_source, "SOURCE_MISMATCH", exc.message
+            )
+        except UnroutableEvent as exc:
+            reason = exc.reason.value if isinstance(exc.reason, RejectReason) else str(exc.reason)
+            return self._rejected_item(index, item, url_source, reason, exc.message)
+        except ValidationFailure as exc:
+            reason = exc.reason.value if isinstance(exc.reason, RejectReason) else str(exc.reason)
+            return self._rejected_item(index, item, url_source, reason, exc.message)
+
+    def _rejected_item(
+        self,
+        index: int,
+        item: Any,
+        url_source: str,
+        reason: str,
+        message: str,
+    ) -> BatchItemResult:
+        event_id = item.get("event_id") if isinstance(item, dict) else None
+        if not isinstance(event_id, str):
+            event_id = None
+        seq = item.get("seq") if isinstance(item, dict) else None
+        if not _is_plain_int(seq):
+            seq = None
+        log_verdict(
+            self.log,
+            event_id=event_id or "-",
+            source=url_source,
+            seq=seq,
+            checkpoint=self.store.get_checkpoint(url_source),
+            verdict=EventStatus.REJECTED.value,
+            reason=reason,
+            attempts=0,
+            message=message,
+        )
+        return BatchItemResult(
+            index=index,
+            event_id=event_id,
+            source=url_source,
+            seq=seq,
+            status=EventStatus.REJECTED,
+            reason=reason,
+            detail=message,
+        )
+
+    # ------------------------------------------------------------------ #
+    # 进度对账
+    # ------------------------------------------------------------------ #
+    def progress(self, source: str) -> ProgressView:
+        snap = self.store.progress_snapshot(source)
+        view = ProgressView(source=source, **snap)
+        self.log.info(
+            "progress snapshot",
+            extra={
+                "event_id": "-",
+                "source": source,
+                "seq": "-",
+                "checkpoint": view.last_seq,
+                "verdict": "PROGRESS",
+                "reason": "-",
+                "attempts": 0,
+            },
+        )
+        return view
+
+    # ------------------------------------------------------------------ #
     # 位点协议
     # ------------------------------------------------------------------ #
     def commit_checkpoint(self, source: str, seq: int) -> int:
@@ -503,26 +635,27 @@ class IngestionService:
             event_id = doc["event_id"]
             lock = self._get_inflight_lock(source, event_id)
             with lock:
-                fresh = self.store.get_event(source, event_id)
-                if fresh is None or fresh.get("status") != EventStatus.RETRYING.value:
-                    continue
-                # 续跑内循环直到终态（成功或死信）
-                while True:
-                    result = self._apply_once(
-                        event_id,
-                        source,
-                        int(fresh["seq"]),
-                        self._payload_of(source, event_id),
-                        attempts=int(fresh.get("attempts", 0)),
-                        new=False,
-                    )
-                    results.append(result)
-                    if result.status in (
-                        EventStatus.APPLIED,
-                        EventStatus.DEAD_LETTER,
-                    ):
-                        break
+                with self.store.transaction(source):
                     fresh = self.store.get_event(source, event_id)
+                    if fresh is None or fresh.get("status") != EventStatus.RETRYING.value:
+                        continue
+                    # 续跑内循环直到终态（成功或死信）
+                    while True:
+                        result = self._apply_once(
+                            event_id,
+                            source,
+                            int(fresh["seq"]),
+                            self._payload_of(source, event_id),
+                            attempts=int(fresh.get("attempts", 0)),
+                            new=False,
+                        )
+                        results.append(result)
+                        if result.status in (
+                            EventStatus.APPLIED,
+                            EventStatus.DEAD_LETTER,
+                        ):
+                            break
+                        fresh = self.store.get_event(source, event_id)
         return results
 
     def _payload_of(self, source: str, event_id: str) -> dict[str, Any]:
@@ -545,14 +678,15 @@ class IngestionService:
                 event_id=event_id,
             )
         with self._get_inflight_lock(source, event_id):
-            self.store.remove_dead_letter(source, event_id)
-            seq = int(existing["seq"])
-            payload = existing.get("payload_snapshot") or {}
-            # 显式重放给予一轮全新尝试机会
-            result = self._apply_once(
-                event_id, source, seq, payload, attempts=0, new=False
-            )
-            return result
+            with self.store.transaction(source):
+                self.store.remove_dead_letter(source, event_id)
+                seq = int(existing["seq"])
+                payload = existing.get("payload_snapshot") or {}
+                # 显式重放给予一轮全新尝试机会
+                result = self._apply_once(
+                    event_id, source, seq, payload, attempts=0, new=False
+                )
+                return result
 
 
 class CrossSourceError(ValidationFailure):

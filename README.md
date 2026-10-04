@@ -4,10 +4,13 @@
 服务基于 FastAPI，可直接本地启动，并通过 HTTP 接口 / pytest 验证以下性质：
 
 - 重复投递、并发投递下，同一事件**只生效一次**，重复请求返回可区分的 `DUPLICATE`，不二次写入、不改既有结果。
+- 支持**批量投递**：一次请求提交同一来源的几十到几百条事件，逐条返回可区分的判定；个别坏事件/重复/暂时失败不连累同批其他事件，整批请求不因此失败。
+- 支持**多进程并发投递重叠批次**：每条事件跨进程仍只生效一次，位点单调推进不回退、不串来源。
 - 每个来源的检查点**只能单调推进**；回退返回 `409 CHECKPOINT_ROLLBACK`，跨来源串用返回 `400 SOURCE_MISMATCH`。
 - 服务重启或重复消费后**不丢事件、不重复落库**；未完成事件可重投或 `/resume` 续跑。
 - 字段缺失 / 类型不匹配 / 结构非法的坏事件按可区分原因**拒绝或隔离**，并可通过故障注入演示**有界重试 → 死信 → 显式重放**。
-- 单条坏事件通过推进位点避免阻塞同来源后续事件；来源之间文件与锁完全隔离，互不阻塞。
+- 单条坏事件通过推进位点避免阻塞同来源后续事件；来源之间文件与锁完全隔离，单个来源的大批次处理不会卡住其他来源。
+- 提供**来源级进度对账**：一个接口看清位点、已生效/隔离/死信/未处理完条数，且与账本、落库结果一致。
 
 ## 快速开始
 
@@ -32,7 +35,60 @@ uv run uvicorn main:app --port 8011   # 启动服务
 }
 ```
 
-投递到 `POST /v1/sources/{source}/events`。
+投递到 `POST /v1/sources/{source}/events`（单条）或 `POST /v1/sources/{source}/events/batch`（批量）。
+
+## 批量投递
+
+`POST /v1/sources/{source}/events/batch` 接受 JSON 数组，或 `{"events": [...]}` 对象：
+
+```json
+[
+  {"event_id": "evt-1", "source": "shop", "seq": 1, "payload": {"v": 1}},
+  {"event_id": "evt-2", "source": "shop", "seq": 2, "payload": {"v": 2}}
+]
+```
+
+- 批次内每条事件走与单条投递**完全相同**的校验、幂等、位点、重试路径。
+- 只要批次信封合法，统一返回 `200`，逐条结果在 `results` 中按 `index` 对应：
+  每条都有 `status`（`APPLIED` / `DUPLICATE` / `QUARANTINED` / `RETRYING` / `DEAD_LETTER` / `REJECTED`）
+  与可区分的 `reason`；`summary` 给出各状态计数。
+- 个别事件重复、畸形或暂时失败**不影响同批其他事件**，也不会让整批请求失败；
+  同一批内重复出现的 `event_id` 只有第一条真正生效，其余判 `DUPLICATE`。
+- 无法标识/路由的条目（缺 `event_id`、非 JSON 对象、跨来源串用等）判为条目级
+  `REJECTED`（带 `MISSING_EVENT_ID` / `MALFORMED_STRUCTURE` / `SOURCE_MISMATCH` 等原因），
+  不隔离、不落库，也不连累其他条目。
+- 与单条接口完全兼容：同一事件无论走单条还是批量接口，共享同一份账本与位点，
+  结论一致（例如先单条投递成功，再出现在批量里会判 `DUPLICATE`）。
+
+## 进度对账
+
+`GET /v1/sources/{source}/progress` 返回该来源的一致性快照：
+
+```json
+{
+  "source": "shop",
+  "last_seq": 12,       // 当前位点
+  "applied": 10,        // 账本中已生效条数
+  "records": 10,        // 目标库实际落库条数（应与 applied 相等）
+  "quarantined": 1,     // 隔离条数
+  "dead_letter": 1,     // 死信条数
+  "pending": 0          // 还没处理完（RETRYING）条数
+}
+```
+
+快照在同一临界区内读取账本、落库、隔离区与死信队列，并发写入期间读取
+也不会出现自相矛盾的数字；`applied` 恒等于 `records`，各计数与
+`/v1/sources/{source}/events`、`/v1/quarantine`、`/v1/dead-letters` 对得上。
+
+## 多进程并发与重叠批次
+
+- 来源级文件（位点/账本/落库）使用**按来源的进程间文件锁**（`<source>/_source.lock`），
+  单条与批量投递的“查账本 → 决定 → 落盘”整体在来源事务内完成：多个进程同时
+  投递重叠批次时，每条事件仍只生效一次，重复请求得到 `DUPLICATE`。
+- 位点只 `max(current, seq)` 单调推进：乱序到达的批次不会让位点倒退，
+  已生效事件不会被重写，落库条数始终等于去重后的事件数。
+- 不同来源使用不同的锁与文件：一个来源的大批次处理不会卡住其他来源。
+- 隔离区/死信等全局文件用单独的全局锁，锁顺序固定为 来源锁 → 全局锁，无死锁。
 
 ## 幂等规则
 
@@ -102,7 +158,9 @@ uv run uvicorn main:app --port 8011   # 启动服务
 
 | 方法 路径 | 说明 |
 | --- | --- |
-| `POST /v1/sources/{source}/events` | 投递事件（幂等应用 / 隔离 / 重试） |
+| `POST /v1/sources/{source}/events` | 投递单条事件（幂等应用 / 隔离 / 重试） |
+| `POST /v1/sources/{source}/events/batch` | 批量投递同一来源的一批事件（逐条判定，200 + results/summary） |
+| `GET  /v1/sources/{source}/progress` | 来源级进度对账（位点 + 各状态条数一致性快照） |
 | `POST /v1/checkpoints` | 显式提交位点（回退 409） |
 | `GET  /v1/sources/{source}/checkpoint` | 查看位点 |
 | `POST /v1/sources/{source}/resume` | 续跑该来源所有未完成事件 |
@@ -142,19 +200,38 @@ curl -s -X POST $B/v1/sources/demo/events -H 'Content-Type: application/json' \
   -d '{"event_id":"c3","source":"demo","seq":3,"payload":{}}'         # -> 202 RETRYING
 curl -s -X POST $B/v1/sources/demo/resume                             # -> 续跑到 APPLIED
 
+# 批量投递：正常 + 重复 + 坏事件混在一批
+curl -s -X POST $B/v1/sources/demo/events/batch -H 'Content-Type: application/json' \
+  -d '{"events":[
+        {"event_id":"b1","source":"demo","seq":10,"payload":{"v":1}},
+        {"event_id":"b1","source":"demo","seq":10,"payload":{"v":1}},
+        {"event_id":"b2","source":"demo","seq":11}
+      ]}'
+# -> 200，results 依次为 APPLIED / DUPLICATE / QUARANTINED(MISSING_FIELD)，summary 有各状态计数
+
+# 进度对账
+curl -s $B/v1/sources/demo/progress
+# -> {"last_seq":11,"applied":...,"records":...,"quarantined":1,"dead_letter":0,"pending":0,...}
+
 curl -s $B/v1/sources/demo/records    # count 应为事件个数（无重复落库）
 ```
 
 ### 2. 自动化测试
 
 ```bash
-uv run pytest          # 23 个用例；live log 逐条打印事件标识/位点/判定/原因/尝试次数
+uv run pytest          # 35 个用例；live log 逐条打印事件标识/位点/判定/原因/尝试次数
 ```
 
 覆盖场景：
 
 - **重复投递**：首次 `APPLIED`，后续 `DUPLICATE`，目标库始终一条，payload 不被篡改覆盖。
 - **并发重复**：20 线程同时投递同一事件，断言恰有 1 个 `APPLIED`、19 个 `DUPLICATE`、落库 1 条。
+- **批量投递**：部分坏事件/部分重复/暂时失败不影响同批其他事件；批内重复 `event_id` 只生效一次；
+  跨来源条目逐条 `REJECTED`；非法批次信封整体 400；大批次不阻塞其他来源。
+- **多进程重叠批次**：`multiprocessing`（spawn，非线程）多个进程并发投递完全重叠/乱序重叠的批次，
+  断言合计只有去重后的事件数个 `APPLIED`、其余全部 `DUPLICATE`，落库条数与去重后事件数一致、
+  位点单调停在最大 seq。
+- **进度对账**：各状态计数与账本/落库/隔离区/死信队列一致；并发写入期间快照满足 `applied == records`。
 - **检查点回退 / 持平 / 跨来源隔离 / 跨来源事件独立**。
 - **重启恢复**：用同一数据目录重建应用，已完成事件仍判 `DUPLICATE`，`RETRYING` 事件 resume 后成功且不重不丢。
 - **畸形事件**：缺字段、类型错、非对象、非法 JSON 分别得到可区分原因；坏事件不阻塞同来源/他来源。
